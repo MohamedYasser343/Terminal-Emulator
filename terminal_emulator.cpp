@@ -9,27 +9,44 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
-#include <errno.h>
 #include <stdexcept>
 #include <cstring>
 
 class TerminalEmulator {
 private:
-    // Terminal state
-    struct termios orig_term;
-    int master_fd = -1;
-    pid_t child_pid = -1;
-    bool running = false;
+    struct termios original_termios_; // Original terminal settings
+    int master_fd_ = -1;              // PTY master file descriptor
+    pid_t child_pid_ = -1;            // Child process ID
+    bool is_running_ = false;         // Emulator running state
 
-    // Input handling
-    std::string buffer;
-    std::vector<std::string> history;
-    size_t history_index = 0;
+    std::string input_buffer_;        // Current user input
+    std::vector<std::string> history_;// Command history
+    size_t history_index_ = 0;        // Current history navigation index
 
-    // Singleton instance for signal handling
-    static TerminalEmulator* instance;
+    static TerminalEmulator* instance_; // Singleton instance for signal handling
 
-    // Helper function for safe writing
+public:
+    TerminalEmulator() {
+        configureTerminal();
+        setupSignalHandlers();
+        initializePty();
+    }
+
+    ~TerminalEmulator() {
+        cleanup();
+    }
+
+    // Runs the terminal emulator's main I/O loop
+    void run() {
+        try {
+            processIO();
+        } catch (const std::runtime_error& e) {
+            std::cerr << "Fatal error: " << e.what() << std::endl;
+        }
+    }
+
+private:
+    // Writes data to a file descriptor with retry on interrupt
     bool safeWrite(int fd, const void* buf, size_t count) {
         const char* ptr = static_cast<const char*>(buf);
         size_t remaining = count;
@@ -37,8 +54,8 @@ private:
         while (remaining > 0) {
             ssize_t written = write(fd, ptr, remaining);
             if (written == -1) {
-                if (errno == EINTR) continue; // Retry on interrupted system call
-                std::cerr << "Write error: " << strerror(errno) << std::endl;
+                if (errno == EINTR) continue;
+                std::cerr << "Write error: " << std::strerror(errno) << std::endl;
                 return false;
             }
             ptr += written;
@@ -47,101 +64,94 @@ private:
         return true;
     }
 
-    // --- Initialization & Cleanup ---
-public:
-    TerminalEmulator() {
-        setRawMode();
-        setupSignals();
-        createPty();
-    }
-
-    ~TerminalEmulator() {
-        cleanup();
-    }
-
-    void run() {
-        try {
-            handleIO();
-        } catch (const std::runtime_error& e) {
-            std::cerr << "Fatal error: " << e.what() << std::endl;
-        }
-    }
-
-private:
+    // Restores terminal settings and cleans up resources
     void cleanup() {
-        if (master_fd != -1) close(master_fd);
-        if (child_pid > 0) {
-            kill(child_pid, SIGTERM);
-            waitpid(child_pid, nullptr, 0);
+        if (master_fd_ != -1) {
+            close(master_fd_);
+            master_fd_ = -1;
+        }
+        if (child_pid_ > 0) {
+            kill(child_pid_, SIGTERM);
+            waitpid(child_pid_, nullptr, 0);
+            child_pid_ = -1;
         }
         restoreTerminal();
-        instance = nullptr;
+        instance_ = nullptr;
     }
 
-    // --- Terminal & PTY setup ---
-    void setRawMode() {
-        if (tcgetattr(STDIN_FILENO, &orig_term) == -1)
-            throw std::runtime_error("Failed to get terminal attributes: " + std::string(strerror(errno)));
+    // Configures stdin for raw mode
+    void configureTerminal() {
+        if (tcgetattr(STDIN_FILENO, &original_termios_) == -1) {
+            throw std::runtime_error("Failed to get terminal attributes: " + std::string(std::strerror(errno)));
+        }
 
-        struct termios raw = orig_term;
+        termios raw = original_termios_;
         raw.c_lflag &= ~(ECHO | ICANON); // Disable echo and canonical mode
-        raw.c_iflag &= ~(IXON | ICRNL);  // Disable flow control and carriage return translation
-        raw.c_lflag |= ISIG;             // Enable signal generation (Ctrl+C, Ctrl+Z, etc.)
-        raw.c_cc[VMIN] = 1;              // Minimum number of characters to read
+        raw.c_iflag &= ~(IXON | ICRNL);  // Disable flow control and CR-to-NL
+        raw.c_lflag |= ISIG;             // Enable signal handling
+        raw.c_cc[VMIN] = 1;              // Read one byte at a time
         raw.c_cc[VTIME] = 0;             // No timeout
 
-        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
-            throw std::runtime_error("Failed to set raw mode: " + std::string(strerror(errno)));
+        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
+            throw std::runtime_error("Failed to set raw mode: " + std::string(std::strerror(errno)));
+        }
     }
 
+    // Restores original terminal settings
     void restoreTerminal() {
-        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term) == -1)
-            std::cerr << "Warning: Failed to restore terminal: " << strerror(errno) << std::endl;
+        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios_) == -1) {
+            std::cerr << "Warning: Failed to restore terminal: " << std::strerror(errno) << std::endl;
+        }
     }
 
-    void createPty() {
+    // Creates a PTY and forks a bash process
+    void initializePty() {
         struct winsize ws;
-        if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == -1)
-            ws = {24, 80, 0, 0};
+        if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == -1) {
+            ws = {24, 80, 0, 0}; // Default size if retrieval fails
+        }
 
         struct termios term;
+        child_pid_ = forkpty(&master_fd_, nullptr, &term, &ws);
+        if (child_pid_ == -1) {
+            throw std::runtime_error("PTY fork failed: " + std::string(std::strerror(errno)));
+        }
 
-        child_pid = forkpty(&master_fd, nullptr, &term, &ws);
-        if (child_pid == -1)
-            throw std::runtime_error("PTY fork failed: " + std::string(strerror(errno)));
-
-        if (child_pid == 0) {
+        if (child_pid_ == 0) { // Child process
             tcgetattr(STDIN_FILENO, &term);
             term.c_lflag &= ~ECHO;
             tcsetattr(STDIN_FILENO, TCSAFLUSH, &term);
             execlp("/bin/bash", "bash", nullptr);
-            std::cerr << "Failed to execute bash: " << strerror(errno) << std::endl;
+            std::cerr << "Failed to execute bash: " << std::strerror(errno) << std::endl;
             exit(1);
         }
     }
 
+    // Adjusts PTY size to match terminal window
     void resizePty() {
         struct winsize ws;
-        if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == -1)
+        if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == -1) {
             return;
-        ioctl(master_fd, TIOCSWINSZ, &ws);
+        }
+        ioctl(master_fd_, TIOCSWINSZ, &ws);
     }
 
-    // --- Signal Handling ---
+    // Signal handler for window resize and interrupts
     static void handleSignal(int sig) {
-        if (!instance) return;
+        if (!instance_) return;
         if (sig == SIGWINCH) {
-            instance->resizePty();
-        } else if (sig == SIGINT && instance->child_pid > 0) {
-            kill(instance->child_pid, SIGINT); // Forward SIGINT to the child process
-        } else if (sig == SIGTERM && instance->child_pid > 0) {
-            kill(instance->child_pid, SIGTERM); // Forward SIGTERM to the child process
+            instance_->resizePty();
+        } else if (sig == SIGINT || sig == SIGTERM) {
+            if (instance_->child_pid_ > 0) {
+                kill(instance_->child_pid_, sig);
+            }
         }
     }
 
-    void setupSignals() {
-        instance = this;
-        struct sigaction sa {};
+    // Sets up signal handlers for SIGWINCH, SIGINT, SIGTERM
+    void setupSignalHandlers() {
+        instance_ = this;
+        struct sigaction sa = {};
         sa.sa_handler = handleSignal;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGWINCH, &sa, nullptr);
@@ -149,174 +159,183 @@ private:
         sigaction(SIGTERM, &sa, nullptr);
     }
 
-    // --- IO Handling ---
-    void handleIO() {
+    // Main I/O loop using poll
+    void processIO() {
         struct pollfd fds[2] = {
             {STDIN_FILENO, POLLIN, 0},
-            {master_fd, POLLIN, 0}
+            {master_fd_, POLLIN, 0}
         };
-        char buf[1024];
-        running = true;
+        char buffer[1024];
+        is_running_ = true;
 
-        while (running) {
+        while (is_running_) {
             if (poll(fds, 2, -1) == -1) {
                 if (errno == EINTR) continue;
-                throw std::runtime_error("Poll error: " + std::string(strerror(errno)));
+                throw std::runtime_error("Poll error: " + std::string(std::strerror(errno)));
             }
 
-            if (fds[0].revents & POLLIN) readUserInput(buf);
-            if (fds[1].revents & POLLIN) readShellOutput(buf);
+            if (fds[0].revents & POLLIN) {
+                readUserInput(buffer);
+            }
+            if (fds[1].revents & POLLIN) {
+                readShellOutput(buffer);
+            }
         }
     }
 
-    void readUserInput(char* buf) {
-        ssize_t n = read(STDIN_FILENO, buf, 1024);
-        if (n <= 0) return;
+    // Reads and processes user input
+    void readUserInput(char* buffer) {
+        ssize_t bytes_read = read(STDIN_FILENO, buffer, 1024);
+        if (bytes_read <= 0) return;
 
-        for (ssize_t i = 0; i < n; ++i) {
-            if (!processInput(buf[i])) {
-                running = false;
+        for (ssize_t i = 0; i < bytes_read; ++i) {
+            if (!processInput(buffer[i])) {
+                is_running_ = false;
                 break;
             }
         }
     }
 
-    void readShellOutput(char* buf) {
-        ssize_t n = read(master_fd, buf, 1024);
-        if (n > 0) {
-            if (!safeWrite(STDOUT_FILENO, buf, n)) {
-                std::cerr << "Failed to write shell output to STDOUT" << std::endl;
-            }
+    // Reads and forwards shell output to stdout
+    void readShellOutput(char* buffer) {
+        ssize_t bytes_read = read(master_fd_, buffer, 1024);
+        if (bytes_read > 0) {
+            safeWrite(STDOUT_FILENO, buffer, bytes_read);
         }
     }
 
-    // --- Input Processing ---
+    // Processes single character input
     bool processInput(char c) {
-        static std::string escape_seq;
+        static std::string escape_sequence;
 
         if (c == 3) { // Ctrl+C
-            killChild(SIGINT); // Send SIGINT to the child process
-            running = false;   // Stop the terminal emulator
-            return false;
+            return sendSignalToChild(SIGINT);
         }
         if (c == 26) { // Ctrl+Z
-            killChild(SIGTSTP);
-            return true;
+            return sendSignalToChild(SIGTSTP);
         }
         if (c == 4) { // Ctrl+D
-            write(master_fd, &c, 1); // Send EOF to the child process
-            running = false;         // Stop the terminal emulator
+            safeWrite(master_fd_, &c, 1);
+            is_running_ = false;
             return false;
         }
-        if (c == 127) return handleBackspace(); // Backspace
-
-        if (handleEscapeSequence(c, escape_seq)) return true;
-
-        if (c == '\r' || c == '\n') return handleEnter();
-
-        buffer += c;
-        write(STDOUT_FILENO, &c, 1);
-        write(master_fd, &c, 1);
-        return true;
-    }
-
-    bool handleEnter() {
-        if (buffer == "exit") return false;
-
-        if (!buffer.empty()) {
-            history.push_back(buffer);
-            history_index = history.size();
+        if (c == 127) { // Backspace
+            return handleBackspace();
         }
-        buffer.clear();
-
-        if (!safeWrite(master_fd, "\n", 1)) {
-            std::cerr << "Failed to write newline to master FD" << std::endl;
-            return false;
-        }
-        if (!safeWrite(STDOUT_FILENO, "\n", 1)) {
-            std::cerr << "Failed to write newline to STDOUT" << std::endl;
-            return false;
-        }
-        return true;
-    }
-
-    bool handleBackspace() {
-        if (buffer.empty()) return true;
-        buffer.pop_back();
-        if (!safeWrite(STDOUT_FILENO, "\b \b", 3)) {
-            std::cerr << "Failed to write backspace to STDOUT" << std::endl;
-            return false;
-        }
-        if (!safeWrite(master_fd, "\b", 1)) {
-            std::cerr << "Failed to write backspace to master FD" << std::endl;
-            return false;
-        }
-        return true;
-    }
-
-    bool handleEscapeSequence(char c, std::string& seq) {
-        if (c == 27) {
-            seq = "\033";
+        if (handleEscapeSequence(c, escape_sequence)) {
             return true;
         }
-        if (!seq.empty()) {
-            seq += c;
-            if (seq.size() == 2 && c != '[') {
-                seq.clear();
+        if (c == '\r' || c == '\n') {
+            return handleEnter();
+        }
+
+        input_buffer_ += c;
+        safeWrite(STDOUT_FILENO, &c, 1);
+        safeWrite(master_fd_, &c, 1);
+        return true;
+    }
+
+    // Handles enter key press
+    bool handleEnter() {
+        if (input_buffer_ == "exit") {
+            is_running_ = false;
+            return false;
+        }
+
+        if (!input_buffer_.empty()) {
+            history_.push_back(input_buffer_);
+            history_index_ = history_.size();
+        }
+        input_buffer_.clear();
+
+        safeWrite(master_fd_, "\n", 1);
+        safeWrite(STDOUT_FILENO, "\n", 1);
+        return true;
+    }
+
+    // Handles backspace key
+    bool handleBackspace() {
+        if (input_buffer_.empty()) return true;
+        input_buffer_.pop_back();
+        safeWrite(STDOUT_FILENO, "\b \b", 3);
+        safeWrite(master_fd_, "\b", 1);
+        return true;
+    }
+
+    // Processes escape sequences (e.g., arrow keys)
+    bool handleEscapeSequence(char c, std::string& sequence) {
+        if (c == 27) { // Escape key
+            sequence = "\033";
+            return true;
+        }
+
+        if (!sequence.empty()) {
+            sequence += c;
+            if (sequence.size() == 2 && c != '[') {
+                safeWrite(master_fd_, sequence.c_str(), sequence.size());
+                sequence.clear();
                 return true;
-            } else if (seq.size() == 3) {
-                handleArrowKey(seq[2]);
-                seq.clear();
+            }
+            if (sequence.size() == 3) {
+                handleArrowKey(sequence[2]);
+                safeWrite(master_fd_, sequence.c_str(), sequence.size());
+                sequence.clear();
                 return true;
             }
         }
         return false;
     }
 
+    // Handles arrow key navigation in command history
     void handleArrowKey(char c) {
-        if (c == 'A' && history_index > 0) { // Up
-            history_index--;
-            showHistory();
-        } else if (c == 'B' && history_index < history.size()) { // Down
-            history_index++;
-            showHistory();
+        if (c == 'A' && history_index_ > 0) { // Up arrow
+            --history_index_;
+            displayHistoryEntry();
+        } else if (c == 'B') { // Down arrow
+            if (history_index_ + 1 < history_.size()) {
+                ++history_index_;
+                displayHistoryEntry();
+            } else {
+                history_index_ = history_.size();
+                input_buffer_.clear();
+                displayHistoryEntry();
+            }
         }
     }
 
-    void showHistory() {
+    // Displays the current history entry
+    void displayHistoryEntry() {
         clearLine();
-        if (history_index < history.size())
-            buffer = history[history_index];
-        else
-            buffer.clear();
-        std::cout << buffer << std::flush;
+        std::string prompt = "$ ";
+        safeWrite(STDOUT_FILENO, prompt.c_str(), prompt.size());
+
+        input_buffer_ = (history_index_ < history_.size()) ? history_[history_index_] : "";
+        safeWrite(STDOUT_FILENO, input_buffer_.c_str(), input_buffer_.size());
     }
 
-    bool killChild(int signal) {
-        if (child_pid > 0) {
-            if (kill(child_pid, signal) == -1) {
-                std::cerr << "Failed to send signal to child: " << strerror(errno) << std::endl;
-                return false;
-            }
-            if (signal == SIGINT || signal == SIGTERM || signal == SIGKILL) {
-                waitpid(child_pid, nullptr, 0); // Wait for the child process to terminate
-                child_pid = -1;
-            }
+    // Sends a signal to the child process
+    bool sendSignalToChild(int signal) {
+        if (child_pid_ <= 0) return true;
+        if (kill(child_pid_, signal) == -1) {
+            std::cerr << "Failed to send signal to child: " << std::strerror(errno) << std::endl;
+            return false;
+        }
+        if (signal == SIGINT || signal == SIGTERM || signal == SIGKILL) {
+            waitpid(child_pid_, nullptr, 0);
+            child_pid_ = -1;
+            is_running_ = false;
         }
         return true;
     }
 
+    // Clears the current input line
     void clearLine() {
-        if (!safeWrite(STDOUT_FILENO, "\r\x1B[K", 4)) {
-            std::cerr << "Failed to clear line" << std::endl;
-        }
+        safeWrite(STDOUT_FILENO, "\r\x1B[K", 4);
     }
 };
 
-// Static init
-TerminalEmulator* TerminalEmulator::instance = nullptr;
+TerminalEmulator* TerminalEmulator::instance_ = nullptr;
 
-// --- Entry Point ---
 int main() {
     try {
         TerminalEmulator terminal;
